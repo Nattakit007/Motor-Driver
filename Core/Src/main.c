@@ -22,12 +22,17 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef struct {
+  int motor_id;   // 1 for Motor 1, 2 for Motor 2
+  int direction;  // 1 for CW, 0 for CCW
+  int steps;      // Number of steps to take
+  int speed_us;   // Microsecond delay between pulses
+} MotorCommand_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -50,7 +55,11 @@ DMA_HandleTypeDef hdma_usart1_rx;
 osThreadId motor1Handle;
 osThreadId motor2Handle;
 /* USER CODE BEGIN PV */
+uint8_t command_buffer[128];
 
+// Include FreeRTOS queue library
+#include "queue.h"
+QueueHandle_t commandQueue;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -85,6 +94,8 @@ int main(void)
 
   /* USER CODE BEGIN 1 */
 
+
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -112,6 +123,8 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_TIM_Base_Start(&htim1); // Start timer for Motor 1
   HAL_TIM_Base_Start(&htim2); // Start timer for Motor 2
+
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart1,command_buffer,sizeof(command_buffer));
   /* USER CODE END 2 */
 
   /* USER CODE BEGIN RTOS_MUTEX */
@@ -128,6 +141,7 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
+  commandQueue = xQueueCreate(10, sizeof(MotorCommand_t));
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -152,8 +166,9 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    // __HAL_UART_ENABLE_IT(&huart1, UART_IT_RXNE, ENABLE);
     /* USER CODE END WHILE */
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -399,7 +414,36 @@ static void MX_GPIO_Init(void)
  * @param DIR_Pin: GPIO pin for Direction
  * @param htim: Hardware Timer handle (e.g., &htim1)
  */
-void Step_Motor(int steps, uint8_t direction, uint16_t speed_us, 
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
+  if (huart->Instance == USART1) {
+
+    // 1. Safely turn the received raw bytes into a standard C string
+    command_buffer[Size] = '\0';
+
+    MotorCommand_t new_cmd;
+
+    // 2. Extract the 4 numbers from the string (Format: "Motor,Dir,Steps,Speed")
+    if (sscanf((char*)command_buffer, "%d,%d,%d,%d",
+               &new_cmd.motor_id, &new_cmd.direction, &new_cmd.steps, &new_cmd.speed_us) == 4) {
+
+      // 3. Push the struct into the FreeRTOS queue
+      BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+      xQueueSendFromISR(commandQueue, &new_cmd, &xHigherPriorityTaskWoken);
+
+      // 4. Force a fast context switch if a motor task was waiting for this
+      portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+               }
+
+    // 5. Restart the DMA listener for the next command
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart1, command_buffer, sizeof(command_buffer));
+    __HAL_DMA_DISABLE_IT(&hdma_usart1_rx, DMA_IT_HT);
+  }
+}
+// ... your Step_Motor function stays the same ...
+
+
+void Step_Motor(int steps, uint8_t direction, uint16_t speed_us,
                 GPIO_TypeDef* STEP_Port, uint16_t STEP_Pin, 
                 GPIO_TypeDef* DIR_Port, uint16_t DIR_Pin,
                 TIM_HandleTypeDef *htim) 
@@ -436,11 +480,25 @@ void Step_Motor(int steps, uint8_t direction, uint16_t speed_us,
 void startmotor1(void const * argument)
 {
   /* USER CODE BEGIN 5 */
+  MotorCommand_t received_cmd;
+
   /* Infinite loop */
   for(;;)
   {
-    Step_Motor(3200, 1, 50, GPIOB, STEP1_Pin, GPIOB, DIR1_Pin, &htim1); // Example: Move 200 steps CW at 500us per step
-    osDelay(1);
+    // xQueueReceive will PAUSE this thread entirely until data arrives.
+    // portMAX_DELAY means it will wait forever, consuming 0% CPU!
+    if (xQueueReceive(commandQueue, &received_cmd, portMAX_DELAY) == pdPASS) {
+
+      // We got a command! Is it meant for Motor 1?
+      if (received_cmd.motor_id == 1) {
+
+        // Execute the physical movement
+        Step_Motor(received_cmd.steps,
+                   received_cmd.direction,
+                   received_cmd.speed_us,
+                   GPIOB, STEP1_Pin, GPIOB, DIR1_Pin, &htim1);
+      }
+    }
   }
   /* USER CODE END 5 */
 }
@@ -455,11 +513,25 @@ void startmotor1(void const * argument)
 void startmotor2(void const * argument)
 {
   /* USER CODE BEGIN startmotor2 */
+  MotorCommand_t received_cmd;
+
   /* Infinite loop */
   for(;;)
   {
-    Step_Motor(3200, 1, 320, GPIOA, STEP2_Pin, GPIOA, DIR2_Pin, &htim2); // Example: Move 200 steps CW at 500us per step
-    osDelay(1);
+    // xQueueReceive will PAUSE this thread entirely until data arrives.
+    // portMAX_DELAY means it will wait forever, consuming 0% CPU!
+    if (xQueueReceive(commandQueue, &received_cmd, portMAX_DELAY) == pdPASS) {
+
+      // We got a command! Is it meant for Motor 1?
+      if (received_cmd.motor_id == 2) {
+
+        // Execute the physical movement
+        Step_Motor(received_cmd.steps,
+                   received_cmd.direction,
+                   received_cmd.speed_us,
+                   GPIOA, STEP2_Pin, GPIOA, DIR2_Pin, &htim2);
+      }
+    }
   }
   /* USER CODE END startmotor2 */
 }
